@@ -3,7 +3,7 @@
 import http from 'http';
 import https from 'https';
 import fetch from 'node-fetch';
-import type { OperationObject } from 'openapi3-ts';
+import type { OpenAPIObject, OperationObject, SchemaObject } from 'openapi3-ts';
 import converter from 'swagger2openapi';
 import Log from './log';
 import { mockGenerator } from './mockGenerator';
@@ -39,7 +39,7 @@ export type GenerateServiceProps = {
    */
   serversPath?: string;
   /**
-   * openAPI 3.0 的地址
+   * Swagger 2.0 或 OpenAPI 3.0 的地址
    */
   schemaPath?: string;
   /**
@@ -48,14 +48,70 @@ export type GenerateServiceProps = {
   projectName?: string;
 
   hook?: {
+    /** change open api data after constructor */
+    afterOpenApiDataInited?: (openAPIData: OpenAPIObject) => OpenAPIObject;
+
     /** 自定义函数名称 */
     customFunctionName?: (data: OperationObject) => string;
     /** 自定义类型名称 */
     customTypeName?: (data: OperationObject) => string;
     /** 自定义类名 */
     customClassName?: (tagName: string) => string;
+
+    /**
+     * 自定义获取type hook
+     * 返回非字符串将使用默认方法获取type
+     * @example set number to string
+     * function customType(schemaObject,namespace){
+     *  if(schemaObject.type==='number' && !schemaObject.format){
+     *    return 'BigDecimalString';
+     *  }
+     * }
+     */
+    customType?: (
+      schemaObject: SchemaObject | undefined,
+      namespace: string,
+      originGetType: (schemaObject: SchemaObject | undefined, namespace: string) => string,
+    ) => string;
+
+    /**
+     * 自定义生成文件名，可返回多个，表示生成多个文件
+     * 返回为空，则使用默认的获取方法获取
+     * @example  使用operationId生成文件名
+     * function customFileNames(operationObject,apiPath){
+     *   const operationId=operationObject.operationId;
+     *   if (!operationId) {
+     *      console.warn('[Warning] no operationId', apiPath);
+     *      return;
+     *    }
+     *    const res = operationId.split('_');
+     *    if (res.length > 1) {
+     *      res.shift();
+     *      if (res.length > 2) {
+     *        console.warn('[Warning]  operationId has more than 2 part', apiPath);
+     *      }
+     *      return [res.join('_')];
+     *    } else {
+     *      const controllerName = (res || [])[0];
+     *      if (controllerName) {
+     *        return [controllerName];
+     *      }
+     *      return;
+     *    }
+     * }
+     */
+    customFileNames?: (
+      operationObject: OperationObject,
+      apiPath: string,
+      _apiMethod: string,
+    ) => string[];
   };
   namespace?: string;
+
+  /**
+   * 默认为false，true时使用null代替可选
+   */
+  nullable?: boolean;
 
   mockFolder?: string;
   /**
@@ -67,6 +123,17 @@ export type GenerateServiceProps = {
    * 枚举样式
    */
   enumStyle?: 'string-literal' | 'enum';
+
+  /**
+   * response中数据字段
+   * example: ['result', 'res']
+   */
+  dataFields?: string[];
+
+  /**
+   * 模板文件、请求函数采用小驼峰命名
+   */
+  isCamelCase?: boolean;
 };
 
 const converterSwaggerToOpenApi = (swagger: any) => {
@@ -118,6 +185,7 @@ export const generateService = async ({
   requestLibPath,
   schemaPath,
   mockFolder,
+  nullable = false,
   ...rest
 }: GenerateServiceProps) => {
   const openAPI = await getOpenAPIConfig(schemaPath);
@@ -127,6 +195,8 @@ export const generateService = async ({
       namespace: 'API',
       requestImportStatement,
       enumStyle: 'string-literal',
+      nullable,
+      isCamelCase: true,
       ...rest,
     },
     openAPI,

@@ -14,6 +14,7 @@ import type {
   SchemaObject,
 } from 'openapi3-ts';
 import { join } from 'path';
+import { camelCase } from 'lodash';
 import ReservedDict from 'reserved-words';
 import rimraf from 'rimraf';
 import pinyin from 'tiny-pinyin';
@@ -49,22 +50,53 @@ export const getPath = () => {
   return existsSync(join(cwd, 'src')) ? join(cwd, 'src') : cwd;
 };
 
+// 兼容C#泛型的typeLastName取法
+function getTypeLastName(typeName) {
+  const tempTypeName = typeName;
+
+  const childrenTypeName = tempTypeName.match(/\[\[.+\]\]/g)?.[0];
+  if (!childrenTypeName) {
+    let publicKeyToken = (tempTypeName.split('PublicKeyToken=')?.[1] ?? '').replace('null', '');
+    const firstTempTypeName = tempTypeName.split(',')?.[0] ?? tempTypeName;
+    let typeLastName = firstTempTypeName.split('/').pop().split('.').pop();
+    if (typeLastName.endsWith('[]')) {
+      typeLastName = typeLastName.substring(0, typeLastName.length - 2) + 'Array';
+    }
+    // 特殊处理C#默认系统类型，不追加publicKeyToken
+    const isCsharpSystemType = firstTempTypeName.startsWith('System.');
+    if (!publicKeyToken || isCsharpSystemType) {
+      return typeLastName;
+    }
+    return `${typeLastName}_${publicKeyToken}`;
+  }
+  const currentTypeName = getTypeLastName(tempTypeName.replace(childrenTypeName, ''));
+  const childrenTypeNameLastName = getTypeLastName(
+    childrenTypeName.substring(2, childrenTypeName.length - 2),
+  );
+  return `${currentTypeName}_${childrenTypeNameLastName}`;
+}
+
 // 类型声明过滤关键字
 const resolveTypeName = (typeName: string) => {
   if (ReservedDict.check(typeName)) {
     return `__openAPI__${typeName}`;
   }
-  const typeLastName = typeName.split('/').pop().split('.').pop();
+  const typeLastName = getTypeLastName(typeName);
 
   const name = typeLastName
     .replace(/[-_ ](\w)/g, (_all, letter) => letter.toUpperCase())
     .replace(/[^\w^\s^\u4e00-\u9fa5]/gi, '');
 
-  if (!/[\u3220-\uFA29]/.test(name)) {
+  // 当model名称是number开头的时候，ts会报错。这种场景一般发生在后端定义的名称是中文
+  if (name === '_' || /^\d+$/.test(name)) {
+    Log('⚠️  models不能以number开头，原因可能是Model定义名称为中文, 建议联系后台修改');
+    return `Pinyin_${name}`;
+  }
+  if (!/[\u3220-\uFA29]/.test(name) && !/^\d$/.test(name)) {
     return name;
   }
-
-  return pinyin.convertToPinyin(name, '', true);
+  const noBlankName = name.replace(/ +/g, '');
+  return pinyin.convertToPinyin(noBlankName, '', true);
 };
 
 function getRefName(refObject: any): string {
@@ -75,7 +107,7 @@ function getRefName(refObject: any): string {
   return resolveTypeName(refPaths[refPaths.length - 1]) as string;
 }
 
-const getType = (schemaObject: SchemaObject | undefined, namespace: string = ''): string => {
+const defaultGetType = (schemaObject: SchemaObject | undefined, namespace: string = ''): string => {
   if (schemaObject === undefined || schemaObject === null) {
     return 'any';
   }
@@ -89,7 +121,6 @@ const getType = (schemaObject: SchemaObject | undefined, namespace: string = '')
   let { type } = schemaObject as any;
 
   const numberEnum = [
-    'int64',
     'integer',
     'long',
     'float',
@@ -108,6 +139,7 @@ const getType = (schemaObject: SchemaObject | undefined, namespace: string = '')
 
   if (numberEnum.includes(schemaObject.format)) {
     type = 'number';
+    if (schemaObject.format === 'int64') type = 'string';
   }
 
   if (schemaObject.enum) {
@@ -138,11 +170,11 @@ const getType = (schemaObject: SchemaObject | undefined, namespace: string = '')
 
     if (Array.isArray(items)) {
       const arrayItemType = (items as any)
-        .map((subType) => getType(subType.schema || subType, namespace))
+        .map((subType) => defaultGetType(subType.schema || subType, namespace))
         .toString();
       return `[${arrayItemType}]`;
     }
-    const arrayType = getType(items, namespace);
+    const arrayType = defaultGetType(items, namespace);
     return arrayType.includes(' | ') ? `(${arrayType})[]` : `${arrayType}[]`;
   }
 
@@ -151,7 +183,7 @@ const getType = (schemaObject: SchemaObject | undefined, namespace: string = '')
       ? Array.from(
           new Set(
             schemaObject.enum.map((v) =>
-              typeof v === 'string' ? `"${v.replace(/"/g, '"')}"` : getType(v),
+              typeof v === 'string' ? `"${v.replace(/"/g, '"')}"` : defaultGetType(v),
             ),
           ),
         ).join(' | ')
@@ -159,10 +191,10 @@ const getType = (schemaObject: SchemaObject | undefined, namespace: string = '')
   }
 
   if (schemaObject.oneOf && schemaObject.oneOf.length) {
-    return schemaObject.oneOf.map((item) => getType(item, namespace)).join(' | ');
+    return schemaObject.oneOf.map((item) => defaultGetType(item, namespace)).join(' | ');
   }
   if (schemaObject.allOf && schemaObject.allOf.length) {
-    return `(${schemaObject.allOf.map((item) => getType(item, namespace)).join(' & ')})`;
+    return `(${schemaObject.allOf.map((item) => defaultGetType(item, namespace)).join(' & ')})`;
   }
   if (schemaObject.type === 'object' || schemaObject.properties) {
     if (!Object.keys(schemaObject.properties || {}).length) {
@@ -174,7 +206,13 @@ const getType = (schemaObject: SchemaObject | undefined, namespace: string = '')
           'required' in (schemaObject.properties[key] || {})
             ? ((schemaObject.properties[key] || {}) as any).required
             : false;
-        return `${key}${required ? '' : '?'}: ${getType(
+        /**
+         * 将类型属性变为字符串，兼容错误格式如：
+         * 3d_tile(数字开头)等错误命名，
+         * 在后面进行格式化的时候会将正确的字符串转换为正常形式，
+         * 错误的继续保留字符串。
+         * */
+        return `'${key}'${required ? '' : '?'}: ${defaultGetType(
           schemaObject.properties && schemaObject.properties[key],
           namespace,
         )}; `;
@@ -234,6 +272,13 @@ const DEFAULT_PATH_PARAM: ParameterObject = {
   type: 'string',
 };
 
+function defaultGetFileTag(operationObject: OperationObject, apiPath: string, _apiMethod: string) {
+  return operationObject['x-swagger-router-controller']
+    ? [operationObject['x-swagger-router-controller']]
+    : operationObject.tags || [operationObject.operationId] || [
+          apiPath.replace('/', '').split('/')[1],
+        ];
+}
 class ServiceGenerator {
   protected apiData: TagAPIDataType = {};
 
@@ -259,6 +304,7 @@ class ServiceGenerator {
     const { info } = openAPIData;
     const basePath = '';
     this.version = info.version;
+    const hookCustomFileNames = this.config.hook?.customFileNames || defaultGetFileTag;
     Object.keys(openAPIData.paths || {}).forEach((p) => {
       const pathItem: PathItemObject = openAPIData.paths[p];
       ['get', 'put', 'post', 'delete', 'patch'].forEach((method) => {
@@ -267,20 +313,13 @@ class ServiceGenerator {
           return;
         }
 
-        // const tags = pathItem['x-swagger-router-controller']
-        //   ? [pathItem['x-swagger-router-controller']]
-        //   : operationObject.tags || [operationObject.operationId] || [
-        //       p.replace('/', '').split('/')[1],
-        //     ];
-
-        const tags = operationObject['x-swagger-router-controller']
-          ? [operationObject['x-swagger-router-controller']]
-          : operationObject.tags || [operationObject.operationId] || [
-              p.replace('/', '').split('/')[1],
-            ];
+        let tags = hookCustomFileNames(operationObject, p, method);
+        if (!tags) {
+          tags = defaultGetFileTag(operationObject, p, method);
+        }
 
         tags.forEach((tagString) => {
-          const tag = resolveTypeName(tagString);
+          const tag = this.config.isCamelCase ? camelCase(resolveTypeName(tagString)) : resolveTypeName(tagString);
 
           if (!this.apiData[tag]) {
             this.apiData[tag] = [];
@@ -293,6 +332,10 @@ class ServiceGenerator {
         });
       });
     });
+    if (this.config.hook?.afterOpenApiDataInited) {
+      this.openAPIData =
+        this.config.hook.afterOpenApiDataInited(this.openAPIData) || this.openAPIData;
+    }
   }
 
   public genFile() {
@@ -314,6 +357,7 @@ class ServiceGenerator {
     // 生成 ts 类型声明
     this.genFileFromTemplate('typings.d.ts', 'interface', {
       namespace: this.config.namespace,
+      nullable: this.config.nullable,
       // namespace: 'API',
       list: this.getInterfaceTP(),
       disableTypeCheck: false,
@@ -355,15 +399,6 @@ class ServiceGenerator {
     return c.length > 0 ? c : null;
   };
 
-  public getTypeName(operationObject: OperationObject) {
-    const namespace = this.config.namespace ? `${this.config.namespace}.` : '';
-    const customeTypeName = this.config?.hook?.customTypeName || this.config?.hook?.customFunctionName;
-
-    return resolveTypeName(
-      `${namespace}${customeTypeName?.(operationObject) ?? operationObject.operationId}Params`,
-    );
-  }
-
   public getFuncationName(data: APIDataType) {
     // 获取路径相同部分
     const pathBasePrefix = this.getBasePrefix(Object.keys(this.openAPIData.paths));
@@ -372,6 +407,13 @@ class ServiceGenerator {
       : data.operationId
       ? this.resolveFunctionName(stripDot(data.operationId), data.method)
       : data.method + this.genDefaultFunctionName(data.path, pathBasePrefix);
+  }
+
+  public getTypeName(data: APIDataType) {
+    const namespace = this.config.namespace ? `${this.config.namespace}.` : '';
+    const typeName = this.config?.hook?.customTypeName?.(data) || this.getFuncationName(data);
+
+    return resolveTypeName(`${namespace}${typeName ?? data.operationId}Params`);
   }
 
   public getServiceTP() {
@@ -417,8 +459,9 @@ class ServiceGenerator {
               );
               if (newApi.extensions && newApi.extensions['x-antTech-description']) {
                 const { extensions } = newApi;
-                const { apiName, antTechVersion, productCode, antTechApiName } =
-                  extensions['x-antTech-description'];
+                const { apiName, antTechVersion, productCode, antTechApiName } = extensions[
+                  'x-antTech-description'
+                ];
                 formattedPath = antTechApiName || formattedPath;
                 this.mappings.push({
                   antTechApi: formattedPath,
@@ -488,7 +531,7 @@ class ServiceGenerator {
 
               return {
                 ...newApi,
-                functionName,
+                functionName: this.config.isCamelCase ? camelCase(functionName) : functionName,
                 typeName: this.getTypeName(newApi),
                 path: getPrefixPath(),
                 pathInComment: formattedPath.replace(/\*/g, '&#42;'),
@@ -499,7 +542,15 @@ class ServiceGenerator {
                 desc:
                   functionName === newApi.summary
                     ? newApi.description
-                    : [newApi.summary, newApi.description].filter((s) => s).join(' '),
+                    : [
+                        newApi.summary,
+                        newApi.description,
+                        (newApi.responses?.default as ResponseObject)?.description
+                          ? `返回值: ${(newApi.responses?.default as ResponseObject).description}`
+                          : '',
+                      ]
+                        .filter((s) => s)
+                        .join(' '),
                 hasHeader: !!(params && params.header) || !!(body && body.mediaType),
                 params: finalParams,
                 hasParams: Boolean(Object.keys(finalParams || {}).length),
@@ -526,7 +577,7 @@ class ServiceGenerator {
         if (genParams.length) {
           this.classNameList.push({
             fileName: className,
-            controllerName: className
+            controllerName: className,
           });
         }
         return {
@@ -558,19 +609,31 @@ class ServiceGenerator {
     // 如果 requestBody 有 required 属性，则正常展示；如果没有，默认非必填
     const required = typeof requestBody.required === 'boolean' ? requestBody.required : false;
     if (schema.type === 'object' && schema.properties) {
-      const propertiesList = Object.keys(schema.properties).map((p) => {
-        if (schema.properties && schema.properties[p] && !['binary', 'base64'].includes((schema.properties[p] as SchemaObject).format || '') && !(['string[]', 'array'].includes((schema.properties[p] as SchemaObject).type || '') && ['binary', 'base64'].includes(((schema.properties[p] as SchemaObject).items as SchemaObject).format || '')) ) {
-          return {
-            key: p,
-            schema: {
-              ...schema.properties[p],
-              type: getType(schema.properties[p], this.config.namespace),
-              required: schema.required?.includes(p) ?? false,
-            },
-          };
-        }
-        return undefined;
-      }).filter(p => p);
+      const propertiesList = Object.keys(schema.properties)
+        .map((p) => {
+          if (
+            schema.properties &&
+            schema.properties[p] &&
+            !['binary', 'base64'].includes((schema.properties[p] as SchemaObject).format || '') &&
+            !(
+              ['string[]', 'array'].includes((schema.properties[p] as SchemaObject).type || '') &&
+              ['binary', 'base64'].includes(
+                ((schema.properties[p] as SchemaObject).items as SchemaObject).format || '',
+              )
+            )
+          ) {
+            return {
+              key: p,
+              schema: {
+                ...schema.properties[p],
+                type: this.getType(schema.properties[p], this.config.namespace),
+                required: schema.required?.includes(p) ?? false,
+              },
+            };
+          }
+          return undefined;
+        })
+        .filter((p) => p);
       return {
         mediaType,
         ...schema,
@@ -581,12 +644,13 @@ class ServiceGenerator {
     return {
       mediaType,
       required,
-      type: getType(schema, this.config.namespace),
+      type: this.getType(schema, this.config.namespace),
     };
   }
   public getFileTP(requestBody: any = {}) {
-    if (requestBody && requestBody.content && requestBody.content['multipart/form-data']) {
-      const ret = this.resolveFileTP(requestBody.content['multipart/form-data'].schema);
+    const reqBody: RequestBodyObject = this.resolveRefObject(requestBody);
+    if (reqBody && reqBody.content && reqBody.content['multipart/form-data']) {
+      const ret = this.resolveFileTP(reqBody.content['multipart/form-data'].schema);
       return ret.length > 0 ? ret : null;
     }
     return null;
@@ -595,12 +659,19 @@ class ServiceGenerator {
     let ret = [];
     const resolved = this.resolveObject(obj);
     const props =
-      (resolved.props && resolved.props.length > 0 &&
-        resolved.props[0].filter((p) => p.format === 'binary' || p.format === 'base64' || ((p.type === 'string[]' || p.type === 'array') && (p.items.format === 'binary' || p.items.format === 'base64')))) ||
+      (resolved.props &&
+        resolved.props.length > 0 &&
+        resolved.props[0].filter(
+          (p) =>
+            p.format === 'binary' ||
+            p.format === 'base64' ||
+            ((p.type === 'string[]' || p.type === 'array') &&
+              (p.items.format === 'binary' || p.items.format === 'base64')),
+        )) ||
       [];
     if (props.length > 0) {
       ret = props.map((p) => {
-        return { title: p.name, multiple: (p.type === 'string[]' || p.type === 'array') };
+        return { title: p.name, multiple: p.type === 'string[]' || p.type === 'array' };
       });
     }
     if (resolved.type) ret = [...ret, ...this.resolveFileTP(resolved.type)];
@@ -608,8 +679,9 @@ class ServiceGenerator {
   }
 
   public getResponseTP(responses: ResponsesObject = {}) {
+    const { components } = this.openAPIData;
     const response: ResponseObject | undefined =
-      responses && this.resolveRefObject(responses.default || responses['200']);
+      responses && this.resolveRefObject(responses.default || responses['200'] || responses['201']);
     const defaultResponse = {
       mediaType: '*/*',
       type: 'any',
@@ -618,11 +690,33 @@ class ServiceGenerator {
       return defaultResponse;
     }
     const resContent: ContentObject | undefined = response.content;
-    const mediaType = Object.keys(resContent || {})[0];
+    const resContentMediaTypes = Object.keys(resContent || {});
+    const mediaType = resContentMediaTypes.includes('application/json')
+      ? 'application/json'
+      : resContentMediaTypes[0]; // 优先使用 application/json
     if (typeof resContent !== 'object' || !mediaType) {
       return defaultResponse;
     }
-    const schema = resContent[mediaType].schema || DEFAULT_SCHEMA;
+    let schema = (resContent[mediaType].schema || DEFAULT_SCHEMA) as SchemaObject;
+
+    if (schema.$ref) {
+      const refPaths = schema.$ref.split('/');
+      const refName = refPaths[refPaths.length - 1];
+      const childrenSchema = components.schemas[refName] as SchemaObject;
+      if (
+        childrenSchema?.type === 'object' &&
+        'properties' in childrenSchema &&
+        this.config.dataFields
+      ) {
+        schema =
+          this.config.dataFields
+            .map((field) => childrenSchema.properties[field])
+            .filter(Boolean)?.[0] ||
+          resContent[mediaType].schema ||
+          DEFAULT_SCHEMA;
+      }
+    }
+
     if ('properties' in schema) {
       Object.keys(schema.properties).map((fieldName) => {
         // eslint-disable-next-line @typescript-eslint/dot-notation
@@ -631,7 +725,7 @@ class ServiceGenerator {
     }
     return {
       mediaType,
-      type: getType(schema, this.config.namespace),
+      type: this.getType(schema, this.config.namespace),
     };
   }
 
@@ -642,7 +736,7 @@ class ServiceGenerator {
     const templateParams: Record<string, ParameterObject[]> = {};
 
     if (parameters && parameters.length) {
-      ['query', 'header', 'path', 'cookie'/* , 'file' */].forEach((source) => {
+      ['query', 'path', 'cookie' /* , 'file' */].forEach((source) => {
         // Possible values are "query", "header", "path" or "cookie". (https://swagger.io/specification/)
         const params = parameters
           .map((p) => this.resolveRefObject(p))
@@ -651,14 +745,14 @@ class ServiceGenerator {
             const isDirectObject = ((p.schema || {}).type || p.type) === 'object';
             const refList = ((p.schema || {}).$ref || p.$ref || '').split('/');
             const ref = refList[refList.length - 1];
-            const deRefObj = (Object.entries(this.openAPIData.components && this.openAPIData.components.schemas || {}).find(
-              ([k]) => k === ref,
-            ) || []) as any;
+            const deRefObj = (Object.entries(
+              (this.openAPIData.components && this.openAPIData.components.schemas) || {},
+            ).find(([k]) => k === ref) || []) as any;
             const isRefObject = (deRefObj[1] || {}).type === 'object';
             return {
               ...p,
               isObject: isDirectObject || isRefObject,
-              type: getType(p.schema || DEFAULT_SCHEMA, this.config.namespace),
+              type: this.getType(p.schema || DEFAULT_SCHEMA, this.config.namespace),
             };
           });
 
@@ -724,7 +818,9 @@ class ServiceGenerator {
         if (!operationObject) {
           return;
         }
-
+        operationObject.parameters = operationObject.parameters?.filter(
+          (item) => (item as ParameterObject)?.in !== 'header',
+        );
         const props = [];
         if (operationObject.parameters) {
           operationObject.parameters.forEach((parameter: any) => {
@@ -732,7 +828,7 @@ class ServiceGenerator {
               desc: parameter.description ?? '',
               name: parameter.name,
               required: parameter.required,
-              type: getType(parameter.schema),
+              type: this.getType(parameter.schema),
             });
           });
         }
@@ -743,7 +839,7 @@ class ServiceGenerator {
               desc: parameter.description ?? '',
               name: parameter.name,
               required: parameter.required,
-              type: getType(parameter.schema),
+              type: this.getType(parameter.schema),
             });
           });
         }
@@ -751,11 +847,11 @@ class ServiceGenerator {
         if (props.length > 0 && data) {
           data.push([
             {
-              typeName: `${this.getFuncationName({ ...operationObject, method, path: p })}Params`,
+              typeName: this.getTypeName({ ...operationObject, method, path: p }),
               type: 'Record<string, any>',
               parent: undefined,
               props: [props],
-              isEnum: false
+              isEnum: false,
             },
           ]);
         }
@@ -763,9 +859,13 @@ class ServiceGenerator {
     });
     // ---- 生成 xxxparams 类型 end---------
 
-    return data && data.reduce((p, c) => p && c && p.concat(c), [])
+    return (
+      data &&
+      data
+        .reduce((p, c) => p && c && p.concat(c), [])
         // 排序下，要不每次git都乱了
-        .sort((a, b) => a.typeName.localeCompare(b.typeName));
+        .sort((a, b) => a.typeName.localeCompare(b.typeName))
+    );
   }
 
   private genFileFromTemplate(
@@ -798,16 +898,29 @@ class ServiceGenerator {
       ? Object.keys(schemaObject.properties).map((propName) => {
           const schema: SchemaObject =
             (schemaObject.properties && schemaObject.properties[propName]) || DEFAULT_SCHEMA;
+          // 剔除属性键值中的特殊符号，因为函数入参变量存在特殊符号会导致解析文件失败
+          propName = propName.replace(/[\[|\]]/g, '');
           return {
             ...schema,
             name: propName,
-            type: getType(schema),
+            type: this.getType(schema),
             desc: [schema.title, schema.description].filter((s) => s).join(' '),
             // 如果没有 required 信息，默认全部是非必填
             required: requiredPropKeys ? requiredPropKeys.some((key) => key === propName) : false,
           };
         })
       : [];
+  }
+
+  getType(schemaObject: SchemaObject | undefined, namespace?: string) {
+    const hookFunc = this.config.hook?.customType;
+    if (hookFunc) {
+      const type = hookFunc(schemaObject, namespace, defaultGetType);
+      if (typeof type === 'string') {
+        return type;
+      }
+    }
+    return defaultGetType(schemaObject, namespace);
   }
 
   resolveObject(schemaObject: SchemaObject) {
@@ -863,7 +976,7 @@ class ServiceGenerator {
         enumStr = Array.from(
           new Set(
             enumArray.map((v) =>
-              typeof v === 'string' ? `"${v.replace(/"/g, '"')}"` : getType(v),
+              typeof v === 'string' ? `"${v.replace(/"/g, '"')}"` : this.getType(v),
             ),
           ),
         ).join(' | ');
@@ -880,8 +993,14 @@ class ServiceGenerator {
 
   resolveAllOfObject(schemaObject: SchemaObject) {
     const props = (schemaObject.allOf || []).map((item) =>
-      item.$ref ? [{ ...item, type: getType(item).split('/').pop() }] : this.getProps(item),
+      item.$ref ? [{ ...item, type: this.getType(item).split('/').pop() }] : this.getProps(item),
     );
+
+    if (schemaObject.properties) {
+      const extProps = this.getProps(schemaObject);
+      return { props: [...props, extProps] };
+    }
+
     return { props };
   }
 
@@ -896,7 +1015,11 @@ class ServiceGenerator {
       ?.replace(pathBasePrefix, '')
       .split('/')
       .map((str) => {
-        let s = str;
+        /**
+         * 兼容错误命名如 /user/:id/:name
+         * 因为是typeName，所以直接进行转换
+         * */
+        let s = resolveTypeName(str);
         if (s.includes('-')) {
           s = s.replace(/(-\w)+/g, (_match: string, p1) => p1?.slice(1).toUpperCase());
         }

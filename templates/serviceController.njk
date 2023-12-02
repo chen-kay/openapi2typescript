@@ -9,7 +9,7 @@ export async function {{ api.functionName }}(
   // 叠加生成的Param类型 (非body参数swagger默认没有生成对象)
   params
   {%- if genType === "ts" -%}
-  : {{namespace}}.{{api.functionName}}Params
+  : {{namespace}}.{{api.typeName}}
     {# header 入参 -#}
     {% if api.params.header -%}
     & { // header
@@ -87,7 +87,15 @@ export async function {{ api.functionName }}(
     {% endif %}
     if (item !== undefined && item !== null) {
       {% if genType === "ts" %}
-      formData.append(ele, (typeof item === 'object' && !(item instanceof File)) ? JSON.stringify(item) : item);
+      if (typeof item === 'object' && !(item instanceof File)) {
+        if (item instanceof Array) {
+          item.forEach((f) => formData.append(ele, f || ''));
+        } else {
+          formData.append(ele, JSON.stringify(item));
+        }
+      } else {
+        formData.append(ele, item);
+      }
       {% else %}
       formData.append(ele, typeof item === 'object' ? JSON.stringify(item) : item);
       {% endif %}
